@@ -515,32 +515,57 @@ test("an unexpected thaw of a managed tab releases the debugger and restarts ina
 });
 
 test("an unexpected thaw survives a failed tab query and is handled on retry", async t => {
-  let now = 100_000;
-  t.mock.method(Date, "now", () => now);
-  t.mock.method(console, "warn", () => {});
-  const browser = createBrowser();
-  browser.record = waitingRecord(browser.tab);
-  await browser.startWorker();
-  assert.equal(browser.record.phase, "attached");
+  const lookups = [
+    { name: "tab list", listed: true },
+    { name: "direct lookup" },
+    { name: "direct lookup after a lookup failure", lookupFailed: true },
+    { name: "direct lookup after an unknown frozen state", frozenUnknown: true },
+  ];
+  for (const { name, listed, lookupFailed, frozenUnknown } of lookups) {
+    await t.test(name, async t => {
+      let now = 100_000;
+      t.mock.method(Date, "now", () => now);
+      t.mock.method(console, "warn", () => {});
+      const browser = createBrowser();
+      browser.record = waitingRecord(browser.tab);
+      await browser.startWorker();
+      assert.equal(browser.record.phase, "attached");
 
-  const query = browser.api.tabs.query;
-  browser.api.tabs.query = async () => { throw new Error("Temporary tab query failure"); };
-  now += 1000;
-  browser.updateTab({ frozen: false });
-  await setImmediate();
+      const query = browser.api.tabs.query;
+      browser.api.tabs.query = async () => { throw new Error("Temporary tab query failure"); };
+      now += 1000;
+      browser.updateTab({ frozen: false });
+      await setImmediate();
 
-  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
-  assert.equal(browser.record.phase, "attached");
-  assert.equal(browser.alarm.scheduledTime, now + 30_000);
+      assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+      assert.equal(browser.record.phase, "attached");
+      assert.equal(browser.alarm.scheduledTime, now + 30_000);
 
-  browser.api.tabs.query = query;
-  now = browser.alarm.scheduledTime;
-  browser.fireAlarm();
-  await setImmediate();
+      browser.api.tabs.query = listed ? query : async () => [];
+      if (lookupFailed || frozenUnknown) {
+        const get = browser.api.tabs.get;
+        browser.api.tabs.get = async () => {
+          if (lookupFailed) throw new Error("Temporary tab lookup failure");
+          return { ...await get(), frozen: undefined };
+        };
+        now = browser.alarm.scheduledTime;
+        browser.fireAlarm();
+        await setImmediate();
 
-  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
-  assert.deepEqual(browser.record, waitingRecord(browser.tab, now));
-  assert.equal(browser.alarm.scheduledTime, now + MINUTE);
+        assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+        assert.equal(browser.record.phase, "attached");
+        assert.equal(browser.alarm.scheduledTime, now + 30_000);
+        browser.api.tabs.get = get;
+      }
+      now = browser.alarm.scheduledTime;
+      browser.fireAlarm();
+      await setImmediate();
+
+      assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+      assert.deepEqual(browser.record, waitingRecord(browser.tab, now));
+      assert.equal(browser.alarm.scheduledTime, now + MINUTE);
+    });
+  }
 });
 
 test("a document change during debugger attachment cancels the freeze before dispatch", async () => {

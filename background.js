@@ -127,9 +127,6 @@ async function reconcile() {
         throw error;
       }
       const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
-      for (const id of thawed) {
-        if (records.get(id)?.phase === "attached" && tabsById.get(id)?.frozen === false) reset.add(id);
-      }
       const ids = new Set([...records.keys(), ...tabsById.keys(), ...removedTabs]);
       const deferred = new Set();
       let debuggerTabs;
@@ -139,7 +136,11 @@ async function reconcile() {
       }));
       // Wait for every tab even if a browser API fails, so passes never overlap.
       const results = await Promise.allSettled([...ids].map(id =>
-        reconcileTab(id, tabsById.get(id), settings, reset.has(id), detached.has(id), deferred, getDebuggerTabs)));
+        reconcileTab(id, tabsById.get(id), settings, {
+          reset: reset.has(id),
+          detached: detached.has(id),
+          thawed: thawed.has(id),
+        }, deferred, getDebuggerTabs)));
       for (const result of results) {
         if (result.status === "rejected") throw result.reason;
       }
@@ -199,7 +200,7 @@ function ownsDebugger(record) {
   return record?.phase === "attached" || record?.phase === "releasing";
 }
 
-async function reconcileTab(id, tab, settings, reset, detached, deferred, getDebuggerTabs) {
+async function reconcileTab(id, tab, settings, { reset, detached, thawed }, deferred, getDebuggerTabs) {
   if (removedTabs.has(id)) {
     await saveRecord(id, null);
     removedTabs.delete(id);
@@ -207,6 +208,7 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getDeb
   }
   if (moving.has(id)) return;
   let record = records.get(id);
+  const pendingThaw = thawed && record?.phase === "attached";
   if (!tab && ownsDebugger(record) && !detached) {
     // A list captured during a window move can arrive after reattachment.
     tab = await getTab(id);
@@ -217,6 +219,7 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getDeb
       if (moving.has(id) || removedTabs.has(id) || resets.has(id)) return;
       if (!targets || targets.available.has(id)) {
         if (reset) resets.add(id);
+        if (pendingThaw) debuggerThaws.add(id);
         deferred.add(id);
         return;
       }
@@ -228,6 +231,7 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getDeb
     return;
   }
 
+  if (pendingThaw && tab.frozen === false) reset = true;
   let eligible = isEligible(tab, settings);
   let documentId = eligible ? await getVerifiedDocumentId(id) : undefined;
   if (ownsDebugger(record)) {
@@ -242,7 +246,9 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getDeb
       const keepInterval = sameInactivity && eligible;
       if (record.phase === "attached" && keepInterval) {
         // Chrome reports a freeze asynchronously after accepting the CDP command.
-        if (!documentId) deferred.add(id);
+        const unknownThaw = pendingThaw && tab.frozen === undefined;
+        if (unknownThaw) debuggerThaws.add(id);
+        if (!documentId || unknownThaw) deferred.add(id);
         return;
       }
       const nextPhase = keepInterval ? record.nextPhase ?? null : null;
