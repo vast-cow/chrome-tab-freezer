@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab Freezer settings</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
+    form { display: grid; gap: 1rem; }
+    textarea { box-sizing: border-box; width: 100%; font: inherit; }
+    select, button { font: inherit; }
+    .help { display: block; margin-bottom: .25rem; font-size: .875rem; }
+    #status { margin-left: .5rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Tab Freezer settings</h1>
+    <form id="settings">
+      <label><input type="checkbox" id="enabled"> Enable automatic freezing</label>
+      <label>Freeze inactive tabs after
+        <select id="timeoutMinutes"></select>
+      </label>
+      <label><input type="checkbox" id="excludeAudible"> Exclude tabs playing audio</label>
+      <label><input type="checkbox" id="excludePinned"> Exclude pinned tabs</label>
+      <div>
+        <label for="excludedHosts">Excluded websites</label>
+        <span class="help" id="host-help">Enter one hostname per line, such as example.com. Subdomains are included.</span>
+        <textarea id="excludedHosts" rows="6" aria-describedby="host-help" spellcheck="false"></textarea>
+      </div>
+      <div><button type="submit" disabled>Save settings</button><span id="status" role="status"></span></div>
+    </form>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>
