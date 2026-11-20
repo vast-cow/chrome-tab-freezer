@@ -116,7 +116,16 @@ async function reconcile() {
       debuggerDetaches.clear();
       debuggerThaws.clear();
 
-      const [settings, tabs] = await Promise.all([readSettings(), chrome.tabs.query({})]);
+      let settings, tabs;
+      try {
+        [settings, tabs] = await Promise.all([readSettings(), chrome.tabs.query({})]);
+      } catch (error) {
+        // Replay the batch along with events received during the failed read.
+        for (const id of reset) resets.add(id);
+        for (const id of detached) debuggerDetaches.add(id);
+        for (const id of thawed) debuggerThaws.add(id);
+        throw error;
+      }
       const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
       for (const id of thawed) {
         if (records.get(id)?.phase === "attached" && tabsById.get(id)?.frozen === false) reset.add(id);
