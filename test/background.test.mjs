@@ -413,6 +413,57 @@ test("cleanup thaw preserves inactivity with both immediate and delayed tab upda
   }
 });
 
+test("cleanup thaw after the retry deadline uses the original inactivity interval", async t => {
+  let now;
+  t.mock.method(Date, "now", () => now);
+  for (const reportThaw of ["event", "alarm"]) {
+    now = 100_000;
+    const browser = createBrowser();
+    const saved = waitingRecord(browser.tab);
+    browser.record = saved;
+    const send = browser.api.debugger.sendCommand;
+    browser.api.debugger.sendCommand = async (...args) => {
+      await send(...args);
+      if (args[2].state === "frozen") {
+        browser.setDocument(undefined);
+      } else {
+        browser.setDocument(DOCUMENT_ID);
+        browser.tab.frozen = true;
+      }
+    };
+    await browser.startWorker();
+    browser.api.debugger.sendCommand = send;
+    assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+
+    for (const retryAt of [130_000, 160_000]) {
+      assert.equal(browser.alarm?.scheduledTime, retryAt);
+      now = retryAt;
+      browser.fireAlarm();
+      await setImmediate();
+
+      assert.equal(browser.record?.phase, "waiting");
+      assert.equal(browser.record.since, saved.since);
+      assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+    }
+    assert.equal(browser.alarm?.scheduledTime, 190_000);
+
+    if (reportThaw === "event") {
+      now = 170_000;
+      browser.updateTab({ frozen: false });
+    } else {
+      browser.tab.frozen = false;
+      now = browser.alarm.scheduledTime;
+      browser.fireAlarm();
+    }
+    await setImmediate();
+
+    assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach", "attach", "frozen"]);
+    assert.equal(browser.record.phase, "attached");
+    assert.equal(browser.record.since, saved.since);
+    assert.equal(browser.alarm, undefined);
+  }
+});
+
 test("an unexpected thaw of a managed tab releases the debugger and restarts inactivity", async t => {
   let now = 100_000;
   t.mock.method(Date, "now", () => now);

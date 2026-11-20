@@ -257,8 +257,10 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
     record = undefined;
   }
   if (tab.frozen) {
-    // Chrome may still report the old state while a cleanup thaw takes effect.
-    if (!(record?.phase === "waiting" && record.snapshotRetryAt > Date.now())) {
+    // Chrome can report the old state even after the cleanup retry is due.
+    if (record?.phase === "waiting" && record.snapshotRetryAt !== undefined) {
+      deferred.add(id);
+    } else {
       await saveRecord(id, null);
     }
     return;
