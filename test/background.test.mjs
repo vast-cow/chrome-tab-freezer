@@ -316,6 +316,57 @@ test("activation and closure cancel a pending freeze retry", async t => {
   }
 });
 
+test("a stale list delivered after reattachment still releases the debugger", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+
+  const get = browser.api.tabs.get;
+  const { promise, resolve } = Promise.withResolvers();
+  browser.api.tabs.query = () => promise;
+  browser.api.tabs.get = async () => { throw new Error("Tab temporarily unavailable during move"); };
+
+  browser.api.tabs.onDetached.fire(TAB_ID);
+  browser.tab.windowId = 2;
+  browser.api.tabs.onAttached.fire(TAB_ID);
+  resolve([]);
+  await setImmediate();
+
+  assert.equal(browser.record?.phase, "attached");
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+  assert.equal(browser.alarm?.scheduledTime, now + 30_000);
+
+  browser.api.tabs.get = get;
+  now = browser.alarm.scheduledTime;
+  browser.fireAlarm();
+  await setImmediate();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+  assert.equal(browser.tab.frozen, false);
+  assert.deepEqual(browser.record, waitingRecord(browser.tab, now));
+  assert.equal(browser.alarm?.scheduledTime, now + MINUTE);
+});
+
+test("closure and replacement clear debugger ownership even when the list still contains the tab", async () => {
+  for (const action of ["close", "replace"]) {
+    const browser = createBrowser();
+    browser.record = waitingRecord(browser.tab);
+    await browser.startWorker();
+    assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+
+    if (action === "close") browser.api.tabs.onRemoved.fire(TAB_ID);
+    else browser.api.tabs.onReplaced.fire(TAB_ID + 1, TAB_ID);
+    await setImmediate();
+
+    assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+    assert.equal(browser.record, undefined);
+    assert.equal(browser.alarm, undefined);
+  }
+});
+
 test("cleanup thaw preserves inactivity with both immediate and delayed tab updates", async t => {
   let now = 100_000;
   t.mock.method(Date, "now", () => now);

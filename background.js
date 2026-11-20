@@ -10,6 +10,7 @@ const resets = new Set();
 const debuggerDetaches = new Set();
 const debuggerThaws = new Set();
 const moving = new Set();
+const removedTabs = new Set();
 let settingsChanged = false;
 let requested = false;
 let running = false;
@@ -18,13 +19,11 @@ let initialized = false;
 chrome.tabs.onActivated.addListener(({ tabId }) => resetTab(tabId));
 chrome.tabs.onCreated.addListener(({ id }) => resetTab(id));
 chrome.tabs.onRemoved.addListener(tabId => {
-  moving.delete(tabId);
-  resetTab(tabId);
+  markRemoved(tabId);
+  requestReconcile();
 });
 chrome.tabs.onReplaced.addListener((added, removed) => {
-  moving.delete(removed);
-  verifiedDocuments.delete(removed);
-  resets.add(removed);
+  markRemoved(removed);
   resetTab(added);
 });
 chrome.tabs.onDetached.addListener(tabId => {
@@ -74,6 +73,13 @@ chrome.runtime.onStartup.addListener(requestReconcile);
 chrome.runtime.onInstalled.addListener(requestReconcile);
 requestReconcile();
 
+function markRemoved(tabId) {
+  moving.delete(tabId);
+  removedTabs.add(tabId);
+  verifiedDocuments.delete(tabId);
+  resets.add(tabId);
+}
+
 function resetTab(tabId) {
   verifiedDocuments.delete(tabId);
   resets.add(tabId);
@@ -115,7 +121,7 @@ async function reconcile() {
       for (const id of thawed) {
         if (records.get(id)?.phase === "attached" && tabsById.get(id)?.frozen === false) reset.add(id);
       }
-      const ids = new Set([...records.keys(), ...tabsById.keys()]);
+      const ids = new Set([...records.keys(), ...tabsById.keys(), ...removedTabs]);
       const deferred = new Set();
       let attachedTabs;
       const getAttachedTabs = () => attachedTabs ??= chrome.debugger.getTargets().then(targets =>
@@ -183,8 +189,23 @@ function ownsDebugger(record) {
 }
 
 async function reconcileTab(id, tab, settings, reset, detached, deferred, getAttachedTabs) {
+  if (removedTabs.has(id)) {
+    await saveRecord(id, null);
+    removedTabs.delete(id);
+    return;
+  }
   if (moving.has(id)) return;
   let record = records.get(id);
+  if (!tab && ownsDebugger(record) && !detached) {
+    // A list captured during a window move can arrive after reattachment.
+    tab = await getTab(id);
+    if (moving.has(id) || removedTabs.has(id)) return;
+    if (!tab) {
+      if (reset) resets.add(id);
+      deferred.add(id);
+      return;
+    }
+  }
   if (!tab) {
     verifiedDocuments.delete(id);
     await saveRecord(id, null);
@@ -275,8 +296,8 @@ async function scheduleAlarm(settings, deferred) {
     when = Math.min(when, retryAt > now ? retryAt : now + RETRY_DELAY);
   }
   for (const [id, record] of records) {
-    if (moving.has(id)) continue;
-    if (record.phase === "waiting" && !deferred.has(id)) {
+    if (moving.has(id) || deferred.has(id)) continue;
+    if (record.phase === "waiting") {
       when = Math.min(when, freezeAt(record, settings));
     }
     if (record.phase === "releasing") when = Math.min(when, record.retryAt ?? now);
