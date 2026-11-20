@@ -178,24 +178,29 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
     if (detached && sameInactivity) {
       // Respect a DevTools takeover or the user's cancellation. Chrome will
       // thaw the page itself if it is still frozen when selected.
-      await saveRecord(id, eligible ? { ...record, phase: "skipped" } : null);
+      await saveRecord(id, eligible ? afterRelease(record, "skipped") : null);
       return;
     }
     if (!detached) {
-      if (sameInactivity && eligible) {
+      const keepInterval = sameInactivity && eligible;
+      if (record.phase === "attached" && keepInterval) {
         // Chrome reports a freeze asynchronously after accepting the CDP command.
-        if (record.phase === "attached") {
-          if (!documentId) deferred.add(id);
-          return;
-        }
-        if (record.retryAt > Date.now()) return;
+        if (!documentId) deferred.add(id);
+        return;
       }
-      if (!await releaseDebugger(id, record)) return;
+      const nextPhase = keepInterval ? record.nextPhase ?? null : null;
+      if (record.retryAt > Date.now()) {
+        if (record.nextPhase && !nextPhase) {
+          await saveRecord(id, { ...record, nextPhase });
+        }
+        return;
+      }
+      if (!await releaseDebugger(id, record, nextPhase)) return;
       tab = await getTab(id);
       eligible = isEligible(tab, settings);
       documentId = eligible ? await getDocumentId(id) : undefined;
     }
-    record = undefined;
+    record = detached ? undefined : records.get(id);
   }
 
   if (!eligible || tab.frozen) {
@@ -283,7 +288,8 @@ async function freezeTab(id, record, settings, deferred, getAttachedTabs) {
   if (superseded()) return;
 
   // Journal the attachment before making Chrome calls that could outlive the worker.
-  await saveRecord(id, { ...record, phase: "attached" });
+  const attachment = { ...record, phase: "attached", needsThaw: false };
+  await saveRecord(id, attachment);
   if (superseded()) {
     await saveRecord(id, record);
     return;
@@ -296,19 +302,26 @@ async function freezeTab(id, record, settings, deferred, getAttachedTabs) {
     return;
   }
 
+  let needsThaw = false;
   let failed = false;
   try {
     // The Tabs API and CDP cannot check selection atomically. Recheck on
     // both sides of the command, and undo the freeze if activity overtook it.
     if (await stillEligible(true)) {
-      await setLifecycle(id, "frozen");
-      if (await stillEligible()) return;
+      // Recovery treats a freeze as possible from this write onward.
+      await saveRecord(id, { ...attachment, needsThaw: true });
+      if (await stillEligible(true) && !superseded()) {
+        needsThaw = true;
+        await setLifecycle(id, "frozen");
+        if (await stillEligible() && !superseded()) return;
+      }
     }
   } catch (error) {
     failed = true;
     console.debug("Tab Freezer could not freeze a tab", id, error);
   }
-  await releaseDebugger(id, record, failed ? { ...record, phase: "skipped" } : record);
+  const nextPhase = failed || debuggerDetaches.has(id) ? "skipped" : "waiting";
+  await releaseDebugger(id, { ...attachment, needsThaw }, nextPhase);
   if (!deferred.has(id)) requestReconcile();
 }
 
@@ -316,20 +329,36 @@ function setLifecycle(id, state) {
   return chrome.debugger.sendCommand({ tabId: id }, "Page.setWebLifecycleState", { state });
 }
 
-async function releaseDebugger(id, record, next = null) {
-  try {
-    await setLifecycle(id, "active");
-    await chrome.debugger.detach({ tabId: id });
-  } catch (error) {
-    const message = String(error);
-    const alreadyDetached = debuggerDetaches.has(id) ||
-      /Debugger is not attached|Detached while handling command/.test(message);
-    if (!alreadyDetached) {
-      console.debug("Tab Freezer will retry debugger cleanup", id, error);
-      await saveRecord(id, { ...record, phase: "releasing", retryAt: Date.now() + RETRY_DELAY });
-      return false;
+function afterRelease(record, phase) {
+  const { needsThaw, retryAt, nextPhase, ...interval } = record;
+  return phase ? { ...interval, phase } : null;
+}
+
+async function releaseDebugger(id, record, nextPhase) {
+  // An older attachment without a journal flag may have frozen the page.
+  let releasing = { ...record, phase: "releasing", needsThaw: record.needsThaw !== false, nextPhase };
+  // Keep cleanup pending in this worker even if a journal write fails.
+  records.set(id, releasing);
+  await saveRecord(id, releasing);
+  if (!debuggerDetaches.has(id)) {
+    try {
+      if (releasing.needsThaw) {
+        await setLifecycle(id, "active");
+        releasing = { ...releasing, needsThaw: false };
+        records.set(id, releasing);
+        await saveRecord(id, releasing);
+      }
+      await chrome.debugger.detach({ tabId: id });
+    } catch (error) {
+      const alreadyDetached = debuggerDetaches.has(id) ||
+        /Debugger is not attached|Detached while handling command/.test(String(error));
+      if (!alreadyDetached) {
+        console.debug("Tab Freezer will retry debugger cleanup", id, error);
+        await saveRecord(id, { ...releasing, retryAt: Date.now() + RETRY_DELAY });
+        return false;
+      }
     }
   }
-  await saveRecord(id, next);
+  await saveRecord(id, afterRelease(releasing, nextPhase));
   return true;
 }

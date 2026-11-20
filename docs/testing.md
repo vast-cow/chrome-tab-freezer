@@ -34,8 +34,12 @@ Run the worker regression tests with Node.js 22 or later.
 node --test test/background.test.mjs
 ```
 
+The tests simulate Chrome freezing the tab during debugger attachment, selection canceling a pending freeze, worker restarts around dispatch, and a detach failure after successful thaw. They assert which lifecycle commands the extension issues and in which order.
+
 ## Browser verification
 
 On November 20, 2026, the headed Linux build of Chrome for Testing Stable **158.0.8127.36** was used to verify the CDP approach before implementation. An attached background page advanced its interval until it received `frozen`. The interval stopped, the page emitted `freeze`, and selecting the tab with an `active` request restored its interval. The document ID, input, JavaScript state, DOM counter, and scroll position survived. In a separate run, detaching while the page was hidden left it frozen until Chrome thawed it on selection. [Chrome for Testing release channels](https://googlechromelabs.github.io/chrome-for-testing/)
 
 The unpacked extension passed the same sequence with the one-minute timeout. Chrome suspended the worker during the wait and woke it at the deadline. The browser checks also covered quick tab switching, a selected tab in another window, pinned and audible tabs, a hostname exclusion, an existing debugger, a window move, navigation, closure, and disabling freezing with a hidden page still frozen.
+
+The document tracking and debugger cleanup updates were verified on the same Stable build. A background tab froze at its original one-minute deadline after `pushState`, `replaceState`, and a fragment change. A second background tab reloaded at the same URL, stayed unfrozen at its old deadline, and froze one minute after the reload. Selecting the first tab resumed its timer with the same main document ID, page instance, and input. The counter values reported at freeze and resume matched.

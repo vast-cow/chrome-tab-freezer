@@ -202,3 +202,159 @@ test("a document change across the freeze command releases the debugger and rest
   assert.equal(browser.record.documentId, "new-document");
   assert.equal(browser.tab.frozen, false);
 });
+
+test("cleanup leaves Chrome's own freeze in place when it happens during attachment", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const attach = browser.api.debugger.attach;
+  browser.api.debugger.attach = async () => {
+    await attach();
+    browser.updateTab({ frozen: true });
+  };
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.tab.frozen, true);
+  assert.equal(browser.record, undefined);
+});
+
+test("selection after the journal write cancels dispatch and detaches directly", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const save = browser.api.storage.session.set;
+  browser.api.storage.session.set = async changes => {
+    await save(changes);
+    if (changes[RECORD_KEY].phase === "attached" && changes[RECORD_KEY].needsThaw) {
+      browser.tab.active = true;
+      browser.api.tabs.onActivated.fire({ tabId: TAB_ID });
+    }
+  };
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.record, undefined);
+});
+
+test("recovery detaches directly if the worker stopped during attachment", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const attach = browser.api.debugger.attach;
+  browser.api.debugger.attach = async () => {
+    await attach();
+    return new Promise(() => {});
+  };
+
+  await browser.startWorker();
+  assert.equal(browser.record.phase, "attached");
+  assert.equal(browser.record.needsThaw, false);
+  browser.tab.frozen = true;
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.tab.frozen, true);
+  assert.equal(browser.record, undefined);
+});
+
+test("recovery thaws conservatively if the worker stopped after journaling dispatch", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const save = browser.api.storage.session.set;
+  browser.api.storage.session.set = async changes => {
+    await save(changes);
+    if (changes[RECORD_KEY].phase === "attached" && changes[RECORD_KEY].needsThaw) {
+      return new Promise(() => {});
+    }
+  };
+
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach"]);
+  assert.equal(browser.record.needsThaw, true);
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "active", "detach"]);
+  assert.equal(browser.record.phase, "waiting");
+});
+
+test("recovery thaws if the worker stopped with a freeze command in flight", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const send = browser.api.debugger.sendCommand;
+  browser.api.debugger.sendCommand = async (...args) => {
+    if (args[2].state === "frozen") {
+      assert.equal(browser.record.needsThaw, true);
+      await send(...args);
+      return new Promise(() => {});
+    }
+    await send(...args);
+  };
+
+  await browser.startWorker();
+  assert.equal(browser.tab.frozen, true);
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+  assert.equal(browser.tab.frozen, false);
+  assert.equal(browser.record.phase, "waiting");
+});
+
+test("a detach failure after thaw is retried without another thaw after restart", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  t.mock.method(console, "debug", () => {});
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen"]);
+
+  const detach = browser.api.debugger.detach;
+  browser.api.debugger.detach = async () => {
+    assert.equal(browser.record.needsThaw, false);
+    browser.debuggerCalls.push("failed detach");
+    throw new Error("Transient detach failure");
+  };
+  browser.tab.active = true;
+  browser.api.tabs.onActivated.fire({ tabId: TAB_ID });
+  await setImmediate();
+
+  assert.equal(browser.tab.frozen, false);
+  assert.equal(browser.record.phase, "releasing");
+  assert.equal(browser.record.needsThaw, false);
+  assert.equal(browser.alarm.scheduledTime, now + 30_000);
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "failed detach"]);
+
+  browser.api.debugger.detach = detach;
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "failed detach"]);
+  now = browser.alarm.scheduledTime;
+  browser.fireAlarm();
+  await setImmediate();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "failed detach", "detach"]);
+  assert.equal(browser.record, undefined);
+});
+
+test("recovery thaws an older attachment with no dispatch flag", async () => {
+  const browser = createBrowser();
+  await browser.api.debugger.attach();
+  browser.tab.frozen = true;
+  browser.record = {
+    phase: "attached",
+    since: Date.now() - MINUTE,
+    url: browser.tab.url,
+    windowId: browser.tab.windowId,
+    lastAccessed: browser.tab.lastAccessed,
+  };
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "active", "detach"]);
+  assert.equal(browser.tab.frozen, false);
+  assert.equal(browser.record.phase, "waiting");
+  assert.equal(browser.record.documentId, DOCUMENT_ID);
+});
