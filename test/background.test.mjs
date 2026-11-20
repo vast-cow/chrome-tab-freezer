@@ -186,6 +186,137 @@ test("an unidentifiable document defers an expired session record without losing
   assert.equal(browser.record.since, saved.since);
 });
 
+test("a failed tab lookup retries through the alarm at most once every 30 seconds", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  const saved = waitingRecord(browser.tab);
+  browser.record = saved;
+  const get = browser.api.tabs.get;
+  let failures = 2;
+  browser.api.tabs.get = async (...args) => {
+    if (failures > 0) {
+      failures--;
+      throw new Error("Temporary tab lookup failure");
+    }
+    return get(...args);
+  };
+
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.record.since, saved.since);
+  assert.equal(browser.alarm.scheduledTime, 130_000);
+
+  now = 110_000;
+  browser.updateTab({ url: browser.tab.url + "#unrelated-to-inactivity" });
+  await setImmediate();
+  await browser.startWorker();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.alarm.scheduledTime, 130_000);
+
+  now = 130_000;
+  browser.fireAlarm();
+  await setImmediate();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach", "attach", "detach"]);
+  assert.equal(browser.alarm.scheduledTime, 160_000);
+
+  now = 160_000;
+  browser.fireAlarm();
+  await setImmediate();
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach", "attach", "detach", "attach", "frozen"]);
+  assert.equal(browser.record.since, saved.since);
+});
+
+test("activation and closure cancel a pending freeze retry", async t => {
+  t.mock.method(Date, "now", () => 100_000);
+  for (const action of ["activate", "close"]) {
+    const browser = createBrowser();
+    browser.record = waitingRecord(browser.tab);
+    const get = browser.api.tabs.get;
+    browser.api.tabs.get = async () => {
+      browser.api.tabs.get = get;
+      return undefined;
+    };
+    await browser.startWorker();
+    assert.equal(browser.alarm.scheduledTime, 130_000);
+
+    if (action === "activate") {
+      browser.tab.active = true;
+      browser.api.tabs.onActivated.fire({ tabId: TAB_ID });
+    } else {
+      browser.api.tabs.query = async () => [];
+      browser.api.tabs.onRemoved.fire(TAB_ID);
+    }
+    await setImmediate();
+    assert.equal(browser.record, undefined);
+    assert.equal(browser.alarm, undefined);
+    assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  }
+});
+
+test("cleanup thaw preserves inactivity with both immediate and delayed tab updates", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  for (const delayed of [false, true]) {
+    now = 100_000;
+    const browser = createBrowser();
+    const saved = waitingRecord(browser.tab);
+    browser.record = saved;
+    const send = browser.api.debugger.sendCommand;
+    browser.api.debugger.sendCommand = async (...args) => {
+      await send(...args);
+      if (args[2].state === "frozen") {
+        browser.setDocument(undefined);
+        browser.updateTab({ frozen: true });
+      } else {
+        browser.setDocument(DOCUMENT_ID);
+        if (delayed) browser.tab.frozen = true;
+        else browser.updateTab({ frozen: false });
+      }
+    };
+
+    await browser.startWorker();
+    assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+    assert.equal(browser.record?.since, saved.since);
+    assert.equal(browser.alarm.scheduledTime, 130_000);
+
+    if (delayed) {
+      now = 110_000;
+      browser.updateTab({ url: browser.tab.url + "#before-thaw-notification" });
+      await setImmediate();
+      assert.equal(browser.record?.since, saved.since);
+      browser.updateTab({ frozen: false });
+      await setImmediate();
+      assert.equal(browser.record?.since, saved.since);
+      assert.equal(browser.alarm.scheduledTime, 130_000);
+    }
+
+    browser.api.debugger.sendCommand = send;
+    now = 130_000;
+    browser.fireAlarm();
+    await setImmediate();
+    assert.equal(browser.record.phase, "attached");
+    assert.equal(browser.record.since, saved.since);
+  }
+});
+
+test("an unexpected thaw of a managed tab releases the debugger and restarts inactivity", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  await browser.startWorker();
+  assert.equal(browser.record.phase, "attached");
+
+  now += 1000;
+  browser.updateTab({ frozen: false });
+  await setImmediate();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
+  assert.deepEqual(browser.record, waitingRecord(browser.tab, now));
+  assert.equal(browser.alarm.scheduledTime, now + MINUTE);
+});
+
 test("a document change across the freeze command releases the debugger and restarts inactivity", async () => {
   const browser = createBrowser();
   browser.record = waitingRecord(browser.tab);

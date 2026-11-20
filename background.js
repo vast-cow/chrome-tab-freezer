@@ -7,6 +7,7 @@ const RETRY_DELAY = 30_000;
 const records = new Map();
 const resets = new Set();
 const debuggerDetaches = new Set();
+const debuggerThaws = new Set();
 const moving = new Set();
 let settingsChanged = false;
 let requested = false;
@@ -36,11 +37,14 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, documentId }) =>
   if (frameId === 0 && records.get(tabId)?.documentId !== documentId) resetTab(tabId);
 });
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.discarded !== undefined || change.splitViewId !== undefined ||
-      change.frozen === false) {
+  if (change.discarded !== undefined || change.splitViewId !== undefined) {
     resetTab(tabId);
   } else if (change.url !== undefined || change.status || change.audible !== undefined ||
       change.pinned !== undefined || change.frozen !== undefined) {
+    // A cleanup thaw can arrive during release or after the waiting record is restored.
+    if (change.frozen === false && records.get(tabId)?.phase === "attached") {
+      debuggerThaws.add(tabId);
+    }
     requestReconcile();
   }
 });
@@ -91,11 +95,16 @@ async function reconcile() {
       settingsChanged = false;
       const reset = new Set(resets);
       const detached = new Set(debuggerDetaches);
+      const thawed = new Set(debuggerThaws);
       resets.clear();
       debuggerDetaches.clear();
+      debuggerThaws.clear();
 
       const [settings, tabs] = await Promise.all([readSettings(), chrome.tabs.query({})]);
       const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
+      for (const id of thawed) {
+        if (records.get(id)?.phase === "attached" && tabsById.get(id)?.frozen === false) reset.add(id);
+      }
       const ids = new Set([...records.keys(), ...tabsById.keys()]);
       const deferred = new Set();
       let attachedTabs;
@@ -197,18 +206,29 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
       }
       if (!await releaseDebugger(id, record, nextPhase)) return;
       tab = await getTab(id);
+      if (!tab) {
+        deferred.add(id);
+        return;
+      }
       eligible = isEligible(tab, settings);
       documentId = eligible ? await getDocumentId(id) : undefined;
     }
     record = detached ? undefined : records.get(id);
   }
 
-  if (!eligible || tab.frozen) {
+  if (!eligible) {
     await saveRecord(id, null);
     return;
   }
   if (record && (reset || !matchesTab(record, tab, documentId ?? record.documentId))) {
     record = undefined;
+  }
+  if (tab.frozen) {
+    // Chrome may still report the old state while a cleanup thaw takes effect.
+    if (!(record?.phase === "waiting" && record.snapshotRetryAt > Date.now())) {
+      await saveRecord(id, null);
+    }
+    return;
   }
   // A subframe can make the tab report loading without changing its main document.
   if (!documentId || !isLoaded(tab)) {
@@ -226,23 +246,28 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
     });
     return;
   }
-  if (record.phase === "waiting" && deadline(record, settings) <= Date.now()) {
-    await freezeTab(id, record, settings, deferred, getAttachedTabs);
+  if (record.phase === "waiting" && freezeAt(record, settings) <= Date.now()) {
+    await freezeTab(id, record, settings, getAttachedTabs);
   }
 }
 
-function deadline(record, settings) {
-  return record.since + settings.timeoutMinutes * MINUTE;
+function freezeAt(record, settings) {
+  return Math.max(record.since + settings.timeoutMinutes * MINUTE, record.snapshotRetryAt ?? 0);
 }
 
 async function scheduleAlarm(settings, deferred) {
-  let when = deferred.size ? Date.now() + RETRY_DELAY : Infinity;
+  const now = Date.now();
+  let when = Infinity;
+  for (const id of deferred) {
+    const retryAt = records.get(id)?.snapshotRetryAt;
+    when = Math.min(when, retryAt > now ? retryAt : now + RETRY_DELAY);
+  }
   for (const [id, record] of records) {
     if (moving.has(id)) continue;
     if (record.phase === "waiting" && !deferred.has(id)) {
-      when = Math.min(when, deadline(record, settings));
+      when = Math.min(when, freezeAt(record, settings));
     }
-    if (record.phase === "releasing") when = Math.min(when, record.retryAt ?? Date.now());
+    if (record.phase === "releasing") when = Math.min(when, record.retryAt ?? now);
   }
   const alarm = await chrome.alarms.get(ALARM);
   if (when === Infinity) {
@@ -268,27 +293,28 @@ async function getDocumentId(id) {
   }
 }
 
-async function freezeTab(id, record, settings, deferred, getAttachedTabs) {
+async function freezeTab(id, record, settings, getAttachedTabs) {
   const superseded = () => settingsChanged || resets.has(id) || debuggerDetaches.has(id);
+  let snapshotUnavailable = false;
   const stillEligible = async (beforeFreeze = false) => {
     const documentId = await getDocumentId(id);
     const tab = await getTab(id);
-    if (superseded() || !isEligible(tab, settings) || (beforeFreeze && tab.frozen)) return false;
-    if (!documentId || !isLoaded(tab)) {
-      deferred.add(id);
-      return false;
-    }
-    return matchesTab(record, tab, documentId);
+    if (superseded()) return false;
+    if (tab && (!isEligible(tab, settings) || (beforeFreeze && tab.frozen) ||
+        !matchesTab(record, tab, documentId ?? record.documentId))) return false;
+    snapshotUnavailable = !tab || !documentId || !isLoaded(tab);
+    return !snapshotUnavailable;
   };
+  const { snapshotRetryAt, ...interval } = record;
   if (superseded()) return;
   if ((await getAttachedTabs()).has(id)) {
-    await saveRecord(id, { ...record, phase: "skipped" });
+    await saveRecord(id, { ...interval, phase: "skipped" });
     return;
   }
   if (superseded()) return;
 
   // Journal the attachment before making Chrome calls that could outlive the worker.
-  const attachment = { ...record, phase: "attached", needsThaw: false };
+  const attachment = { ...interval, phase: "attached", needsThaw: false };
   await saveRecord(id, attachment);
   if (superseded()) {
     await saveRecord(id, record);
@@ -298,7 +324,7 @@ async function freezeTab(id, record, settings, deferred, getAttachedTabs) {
     await chrome.debugger.attach({ tabId: id }, "1.3");
   } catch (error) {
     console.debug("Tab Freezer skipped debugger attachment", id, error);
-    await saveRecord(id, { ...record, phase: "skipped" });
+    await saveRecord(id, { ...interval, phase: "skipped" });
     return;
   }
 
@@ -321,8 +347,10 @@ async function freezeTab(id, record, settings, deferred, getAttachedTabs) {
     console.debug("Tab Freezer could not freeze a tab", id, error);
   }
   const nextPhase = failed || debuggerDetaches.has(id) ? "skipped" : "waiting";
-  await releaseDebugger(id, { ...attachment, needsThaw }, nextPhase);
-  if (!deferred.has(id)) requestReconcile();
+  const cleanup = { ...attachment, needsThaw };
+  if (snapshotUnavailable) cleanup.snapshotRetryAt = Date.now() + RETRY_DELAY;
+  await releaseDebugger(id, cleanup, nextPhase);
+  if (!snapshotUnavailable) requestReconcile();
 }
 
 function setLifecycle(id, state) {
