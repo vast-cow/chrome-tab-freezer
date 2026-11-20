@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab Freezer test page</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+    dt { font-weight: 600; }
+    input, output { font: inherit; }
+    #events { padding-left: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Tab Freezer test page</h1>
+  <p><label for="counter">Interval counter</label> <output id="counter">0</output></p>
+  <p><label for="sample">Sample text</label> <input id="sample" autocomplete="off"></p>
+  <dl>
+    <dt>Page instance</dt>
+    <dd id="instance"></dd>
+    <dt>Discarded by Chrome before loading</dt>
+    <dd id="discarded"></dd>
+  </dl>
+  <h2>Lifecycle events</h2>
+  <ol id="events"></ol>
+  <script>
+    const counter = document.querySelector("#counter");
+    const instance = document.querySelector("#instance");
+    const events = document.querySelector("#events");
+    let count = 0;
+
+    instance.textContent = crypto.randomUUID();
+    document.querySelector("#discarded").textContent = String(document.wasDiscarded);
+    setInterval(() => {
+      counter.value = ++count;
+    }, 500);
+
+    function logLifecycle(event) {
+      const entry = document.createElement("li");
+      entry.textContent = `${new Date().toISOString()} ${event.type} at counter ${count}`;
+      events.append(entry);
+      console.info(entry.textContent);
+    }
+
+    document.addEventListener("freeze", logLifecycle);
+    document.addEventListener("resume", logLifecycle);
+  </script>
+</body>
+</html>
