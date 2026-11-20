@@ -367,6 +367,39 @@ test("closure and replacement clear debugger ownership even when the list still 
   }
 });
 
+test("restart recovery clears a missing tab's ownership once its debugger target is gone", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  const saved = { ...waitingRecord(browser.tab), phase: "attached", needsThaw: true };
+  browser.record = saved;
+  browser.api.tabs.query = async () => [];
+  browser.api.tabs.get = async () => { throw new Error("Tab unavailable"); };
+
+  const getTargets = browser.api.debugger.getTargets;
+  browser.api.debugger.getTargets = async () => { throw new Error("Temporary target lookup failure"); };
+  await browser.startWorker();
+  assert.deepEqual(browser.record, saved);
+  assert.equal(browser.alarm.scheduledTime, now + 30_000);
+
+  // Even an unattached target can belong to a tab that is temporarily unavailable.
+  browser.api.debugger.getTargets = getTargets;
+  now = browser.alarm.scheduledTime;
+  browser.fireAlarm();
+  await setImmediate();
+  assert.deepEqual(browser.record, saved);
+  assert.equal(browser.alarm.scheduledTime, now + 30_000);
+
+  browser.api.debugger.getTargets = async () => [{ tabId: TAB_ID + 1, attached: true }];
+  now = browser.alarm.scheduledTime;
+  browser.fireAlarm();
+  await setImmediate();
+
+  assert.deepEqual(browser.debuggerCalls, []);
+  assert.equal(browser.record, undefined);
+  assert.equal(browser.alarm, undefined);
+});
+
 test("cleanup thaw preserves inactivity with both immediate and delayed tab updates", async t => {
   let now = 100_000;
   t.mock.method(Date, "now", () => now);

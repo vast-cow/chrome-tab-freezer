@@ -132,12 +132,14 @@ async function reconcile() {
       }
       const ids = new Set([...records.keys(), ...tabsById.keys(), ...removedTabs]);
       const deferred = new Set();
-      let attachedTabs;
-      const getAttachedTabs = () => attachedTabs ??= chrome.debugger.getTargets().then(targets =>
-        new Set(targets.filter(target => target.attached).map(target => target.tabId)));
+      let debuggerTabs;
+      const getDebuggerTabs = () => debuggerTabs ??= chrome.debugger.getTargets().then(targets => ({
+        available: new Set(targets.map(target => target.tabId)),
+        attached: new Set(targets.filter(target => target.attached).map(target => target.tabId)),
+      }));
       // Wait for every tab even if a browser API fails, so passes never overlap.
       const results = await Promise.allSettled([...ids].map(id =>
-        reconcileTab(id, tabsById.get(id), settings, reset.has(id), detached.has(id), deferred, getAttachedTabs)));
+        reconcileTab(id, tabsById.get(id), settings, reset.has(id), detached.has(id), deferred, getDebuggerTabs)));
       for (const result of results) {
         if (result.status === "rejected") throw result.reason;
       }
@@ -197,7 +199,7 @@ function ownsDebugger(record) {
   return record?.phase === "attached" || record?.phase === "releasing";
 }
 
-async function reconcileTab(id, tab, settings, reset, detached, deferred, getAttachedTabs) {
+async function reconcileTab(id, tab, settings, reset, detached, deferred, getDebuggerTabs) {
   if (removedTabs.has(id)) {
     await saveRecord(id, null);
     removedTabs.delete(id);
@@ -210,9 +212,14 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
     tab = await getTab(id);
     if (moving.has(id) || removedTabs.has(id)) return;
     if (!tab) {
-      if (reset) resets.add(id);
-      deferred.add(id);
-      return;
+      const targets = await getDebuggerTabs().catch(() => undefined);
+      // A tab event can supersede the missing snapshots while targets are read.
+      if (moving.has(id) || removedTabs.has(id) || resets.has(id)) return;
+      if (!targets || targets.available.has(id)) {
+        if (reset) resets.add(id);
+        deferred.add(id);
+        return;
+      }
     }
   }
   if (!tab) {
@@ -291,7 +298,7 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
     return;
   }
   if (record.phase === "waiting" && freezeAt(record, settings) <= Date.now()) {
-    await freezeTab(id, record, settings, getAttachedTabs);
+    await freezeTab(id, record, settings, getDebuggerTabs);
   }
 }
 
@@ -350,7 +357,7 @@ async function getVerifiedDocumentId(id) {
   return documentId;
 }
 
-async function freezeTab(id, record, settings, getAttachedTabs) {
+async function freezeTab(id, record, settings, getDebuggerTabs) {
   const superseded = () => settingsChanged || resets.has(id) || debuggerDetaches.has(id);
   let snapshotUnavailable = false;
   const stillEligible = async (beforeFreeze = false) => {
@@ -364,7 +371,7 @@ async function freezeTab(id, record, settings, getAttachedTabs) {
   };
   const { snapshotRetryAt, ...interval } = record;
   if (superseded()) return;
-  if ((await getAttachedTabs()).has(id)) {
+  if ((await getDebuggerTabs()).attached.has(id)) {
     await saveRecord(id, { ...interval, phase: "skipped" });
     return;
   }
