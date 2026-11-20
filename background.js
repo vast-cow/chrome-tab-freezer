@@ -5,6 +5,7 @@ const RECORD_PREFIX = "tab:";
 const MINUTE = 60_000;
 const RETRY_DELAY = 30_000;
 const records = new Map();
+const verifiedDocuments = new Map();
 const resets = new Set();
 const debuggerDetaches = new Set();
 const debuggerThaws = new Set();
@@ -22,6 +23,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 chrome.tabs.onReplaced.addListener((added, removed) => {
   moving.delete(removed);
+  verifiedDocuments.delete(removed);
   resets.add(removed);
   resetTab(added);
 });
@@ -34,13 +36,20 @@ chrome.tabs.onAttached.addListener(tabId => {
   resetTab(tabId);
 });
 chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, documentId }) => {
-  if (frameId === 0 && records.get(tabId)?.documentId !== documentId) resetTab(tabId);
+  if (frameId !== 0) return;
+  if (records.get(tabId)?.documentId !== documentId) {
+    resetTab(tabId);
+  } else {
+    verifiedDocuments.delete(tabId);
+    requestReconcile();
+  }
 });
 chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.discarded !== undefined || change.splitViewId !== undefined) {
     resetTab(tabId);
   } else if (change.url !== undefined || change.status || change.audible !== undefined ||
       change.pinned !== undefined || change.frozen !== undefined) {
+    if (change.url !== undefined || change.status) verifiedDocuments.delete(tabId);
     // A cleanup thaw can arrive during release or after the waiting record is restored.
     if (change.frozen === false && records.get(tabId)?.phase === "attached") {
       debuggerThaws.add(tabId);
@@ -66,6 +75,7 @@ chrome.runtime.onInstalled.addListener(requestReconcile);
 requestReconcile();
 
 function resetTab(tabId) {
+  verifiedDocuments.delete(tabId);
   resets.add(tabId);
   requestReconcile();
 }
@@ -176,12 +186,13 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
   if (moving.has(id)) return;
   let record = records.get(id);
   if (!tab) {
+    verifiedDocuments.delete(id);
     await saveRecord(id, null);
     return;
   }
 
   let eligible = isEligible(tab, settings);
-  let documentId = eligible ? await getDocumentId(id) : undefined;
+  let documentId = eligible ? await getVerifiedDocumentId(id) : undefined;
   if (ownsDebugger(record)) {
     const sameInactivity = !reset && matchesTab(record, tab, documentId ?? record.documentId);
     if (detached && sameInactivity) {
@@ -205,13 +216,14 @@ async function reconcileTab(id, tab, settings, reset, detached, deferred, getAtt
         return;
       }
       if (!await releaseDebugger(id, record, nextPhase)) return;
+      verifiedDocuments.delete(id);
       tab = await getTab(id);
       if (!tab) {
         deferred.add(id);
         return;
       }
       eligible = isEligible(tab, settings);
-      documentId = eligible ? await getDocumentId(id) : undefined;
+      documentId = eligible ? await getVerifiedDocumentId(id) : undefined;
     }
     record = detached ? undefined : records.get(id);
   }
@@ -293,6 +305,19 @@ async function getDocumentId(id) {
   }
 }
 
+async function getVerifiedDocumentId(id) {
+  let lookup = verifiedDocuments.get(id);
+  if (!lookup) {
+    lookup = getDocumentId(id);
+    verifiedDocuments.set(id, lookup);
+  }
+  const documentId = await lookup;
+  // Navigation can invalidate a lookup while Chrome is returning it.
+  if (verifiedDocuments.get(id) !== lookup) return undefined;
+  if (!documentId) verifiedDocuments.delete(id);
+  return documentId;
+}
+
 async function freezeTab(id, record, settings, getAttachedTabs) {
   const superseded = () => settingsChanged || resets.has(id) || debuggerDetaches.has(id);
   let snapshotUnavailable = false;
@@ -349,6 +374,7 @@ async function freezeTab(id, record, settings, getAttachedTabs) {
   const nextPhase = failed || debuggerDetaches.has(id) ? "skipped" : "waiting";
   const cleanup = { ...attachment, needsThaw };
   if (snapshotUnavailable) cleanup.snapshotRetryAt = Date.now() + RETRY_DELAY;
+  verifiedDocuments.delete(id);
   await releaseDebugger(id, cleanup, nextPhase);
   if (!snapshotUnavailable) requestReconcile();
 }

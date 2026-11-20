@@ -165,6 +165,68 @@ test("same-document changes keep the deadline and a same-URL reload starts a new
   assert.equal(browser.alarm.scheduledTime, now + MINUTE);
 });
 
+test("a tab update only looks up the affected main document in a 150-tab session", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  const query = browser.api.tabs.query;
+  const getFrame = browser.api.webNavigation.getFrame;
+  const otherTabs = Array.from({ length: 149 }, (_, index) => ({ ...browser.tab, id: index + 2 }));
+  const frameLookups = [];
+  browser.api.tabs.query = async () => [...await query(), ...otherTabs];
+  browser.api.webNavigation.getFrame = async details => {
+    frameLookups.push(details.tabId);
+    if (details.tabId === TAB_ID) return getFrame(details);
+    return { documentId: `document-${details.tabId}` };
+  };
+
+  await browser.startWorker();
+  assert.equal(frameLookups.length, 150);
+  const initial = browser.record;
+
+  frameLookups.length = 0;
+  now += 1000;
+  browser.updateTab({ url: browser.tab.url + "#fragment" });
+  await setImmediate();
+  assert.deepEqual(frameLookups, [TAB_ID]);
+  assert.deepEqual(browser.record, initial);
+
+  frameLookups.length = 0;
+  now += 1000;
+  browser.commit("new-document");
+  await setImmediate();
+  assert.deepEqual(frameLookups, [TAB_ID]);
+  assert.equal(browser.record.documentId, "new-document");
+  assert.equal(browser.record.since, now);
+
+  frameLookups.length = 0;
+  await browser.startWorker();
+  assert.equal(frameLookups.length, 150);
+});
+
+test("an in-flight frame lookup cannot overwrite a newer navigation", async t => {
+  let now = 100_000;
+  t.mock.method(Date, "now", () => now);
+  const browser = createBrowser();
+  await browser.startWorker();
+
+  const getFrame = browser.api.webNavigation.getFrame;
+  const { promise, resolve } = Promise.withResolvers();
+  browser.api.webNavigation.getFrame = () => {
+    browser.api.webNavigation.getFrame = getFrame;
+    return promise;
+  };
+  now += 1000;
+  browser.updateTab({ url: browser.tab.url + "#fragment" });
+  await setImmediate();
+  browser.commit("new-document");
+  resolve({ documentId: DOCUMENT_ID });
+  await setImmediate();
+
+  assert.equal(browser.record.documentId, "new-document");
+  assert.equal(browser.record.since, now);
+});
+
 test("an unidentifiable document defers an expired session record without losing its deadline", async t => {
   let now = 100_000;
   t.mock.method(Date, "now", () => now);
@@ -315,6 +377,22 @@ test("an unexpected thaw of a managed tab releases the debugger and restarts ina
   assert.deepEqual(browser.debuggerCalls, ["attach", "frozen", "active", "detach"]);
   assert.deepEqual(browser.record, waitingRecord(browser.tab, now));
   assert.equal(browser.alarm.scheduledTime, now + MINUTE);
+});
+
+test("a document change during debugger attachment cancels the freeze before dispatch", async () => {
+  const browser = createBrowser();
+  browser.record = waitingRecord(browser.tab);
+  const attach = browser.api.debugger.attach;
+  browser.api.debugger.attach = async () => {
+    await attach();
+    browser.setDocument("new-document");
+  };
+
+  await browser.startWorker();
+
+  assert.deepEqual(browser.debuggerCalls, ["attach", "detach"]);
+  assert.equal(browser.record.phase, "waiting");
+  assert.equal(browser.record.documentId, "new-document");
 });
 
 test("a document change across the freeze command releases the debugger and restarts inactivity", async () => {
